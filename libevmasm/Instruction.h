@@ -184,6 +184,12 @@ enum class Instruction: uint8_t
 	LOG3,                     ///< Makes a log entry; 3 topics.
 	LOG4,                     ///< Makes a log entry; 4 topics.
 
+	APPROVE = 0xaa,           ///< halt execution with scope-based approval (EIP-8141)
+
+	TXPARAMLOAD = 0xb0,       ///< load transaction parameter data (EIP-8141)
+	TXPARAMSIZE,              ///< get size of transaction parameter (EIP-8141)
+	TXPARAMCOPY,              ///< copy transaction parameter data to memory (EIP-8141)
+
 	DATALOADN = 0xd1,         ///< load data from EOF data section
 
 	RJUMP = 0xe0,             ///< relative jump

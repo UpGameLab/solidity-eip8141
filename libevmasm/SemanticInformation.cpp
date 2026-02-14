@@ -79,6 +79,7 @@ std::vector<SemanticInformation::Operation> SemanticInformation::readWriteOperat
 	}
 	case Instruction::REVERT:
 	case Instruction::RETURN:
+	case Instruction::APPROVE:
 	case Instruction::KECCAK256:
 	case Instruction::LOG0:
 	case Instruction::LOG1:
@@ -120,6 +121,18 @@ std::vector<SemanticInformation::Operation> SemanticInformation::readWriteOperat
 		op.location = Location::Memory;
 		op.startParameter = 0;
 		op.lengthParameter = 2;
+		return {op};
+	}
+	case Instruction::TXPARAMCOPY:
+	{
+		assertThrow(memory(_instruction) == Effect::Write, OptimizerException, "");
+		assertThrow(storage(_instruction) == Effect::None, OptimizerException, "");
+		assertThrow(transientStorage(_instruction) == Effect::None, OptimizerException, "");
+		Operation op;
+		op.effect = memory(_instruction);
+		op.location = Location::Memory;
+		op.startParameter = 2;
+		op.lengthParameter = 4;
 		return {op};
 	}
 	case Instruction::MCOPY:
@@ -344,6 +357,7 @@ bool SemanticInformation::altersControlFlow(AssemblyItem const& _item)
 	case Instruction::RJUMP:
 	case Instruction::RJUMPI:
 	case Instruction::RETURN:
+	case Instruction::APPROVE:
 	case Instruction::SELFDESTRUCT:
 	case Instruction::STOP:
 	case Instruction::INVALID:
@@ -370,6 +384,7 @@ bool SemanticInformation::terminatesControlFlow(Instruction _instruction)
 	switch (_instruction)
 	{
 	case Instruction::RETURN:
+	case Instruction::APPROVE:
 	case Instruction::SELFDESTRUCT:
 	case Instruction::STOP:
 	case Instruction::INVALID:
@@ -500,6 +515,7 @@ SemanticInformation::Effect SemanticInformation::memory(Instruction _instruction
 	case Instruction::EXTCODECOPY:
 	case Instruction::RETURNDATACOPY:
 	case Instruction::MCOPY:
+	case Instruction::TXPARAMCOPY:
 	case Instruction::MSTORE:
 	case Instruction::MSTORE8:
 	case Instruction::CALL:
@@ -514,6 +530,7 @@ SemanticInformation::Effect SemanticInformation::memory(Instruction _instruction
 	case Instruction::MLOAD:
 	case Instruction::MSIZE:
 	case Instruction::RETURN:
+	case Instruction::APPROVE:
 	case Instruction::REVERT:
 	case Instruction::LOG0:
 	case Instruction::LOG1:

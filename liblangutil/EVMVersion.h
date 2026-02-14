@@ -146,6 +146,7 @@ public:
 	bool hasMcopy() const { return *this >= cancun(); }
 	bool supportsTransientStorage() const { return *this >= cancun(); }
 	bool supportsEOF() const { return *this >= firstWithEOF(); }
+	bool hasFrameTransaction() const { return *this >= osaka(); }
 
 	bool hasOpcode(evmasm::Instruction _opcode, std::optional<uint8_t> _eofVersion) const;
 

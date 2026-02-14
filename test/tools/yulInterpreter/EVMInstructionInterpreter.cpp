@@ -392,12 +392,33 @@ u256 EVMInstructionInterpreter::eval(
 			(arg[1] == util::h160::Arith(m_state.address) || (arg[1] & 1))
 		) ? 1 : 0;
 	case Instruction::RETURN:
+	case Instruction::APPROVE:
 	{
 		m_state.returndata = {};
 		if (accessMemory(arg[0], arg[1]))
 			m_state.returndata = m_state.readMemory(arg[0], arg[1]);
 		logTrace(_instruction, arg, m_state.returndata);
 		BOOST_THROW_EXCEPTION(ExplicitlyTerminatedWithReturn());
+	}
+	case Instruction::TXPARAMLOAD:
+		logTrace(_instruction, arg);
+		return u256(keccak256(h256(arg[0]))) ^ arg[2];
+	case Instruction::TXPARAMSIZE:
+		logTrace(_instruction, arg);
+		return u256(keccak256(h256(arg[0]))) & 0xfff;
+	case Instruction::TXPARAMCOPY:
+	{
+		// Mock: fill destination memory with deterministic data
+		bytes mockData(size_t(arg[4]), 0);
+		for (size_t i = 0; i < mockData.size(); ++i)
+			mockData[i] = uint8_t(i);
+		if (accessMemory(arg[2], arg[4]))
+			copyZeroExtended(
+				m_state.memory, mockData,
+				size_t(arg[2]), size_t(arg[3]), size_t(arg[4])
+			);
+		logTrace(_instruction, arg);
+		return 0;
 	}
 	case Instruction::REVERT:
 		accessMemory(arg[0], arg[1]);
