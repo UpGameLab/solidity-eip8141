@@ -180,4 +180,10 @@ h256 keccak256(bytesConstRef _input)
 	return output;
 }
 
+void shake256(uint8_t* _out, size_t _outlen, uint8_t const* _in, size_t _inlen)
+{
+	// SHAKE-256: rate = 136 bytes (= 200 - 512/8), domain = 0x1F (FIPS 202 XOF).
+	hash(_out, _outlen, _in, _inlen, 136, 0x1F);
+}
+
 }

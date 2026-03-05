@@ -43,4 +43,7 @@ inline h256 keccak256(std::string const& _input) { return keccak256(bytesConstRe
 /// Calculate Keccak-256 hash of the given input (presented as a FixedHash), returns a 256-bit hash.
 template<unsigned N> inline h256 keccak256(FixedHash<N> const& _input) { return keccak256(_input.ref()); }
 
+/// SHAKE-256 XOF (FIPS 202): produces @a _outlen bytes of output from @a _inlen bytes of input.
+void shake256(uint8_t* _out, size_t _outlen, uint8_t const* _in, size_t _inlen);
+
 }

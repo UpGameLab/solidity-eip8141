@@ -197,6 +197,13 @@ void EVMHost::reset()
 		if (precompiledAddress < 5 || m_evmVersion >= langutil::EVMVersion::byzantium())
 			accounts[address].codehash = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470_bytes32;
 	}
+	// EIP-8051 ML-DSA precompiles at 0x12 and 0x13.
+	for (unsigned addr: {0x12u, 0x13u})
+	{
+		evmc::address address{addr};
+		accounts[address].balance = evmc::uint256be{1};
+		accounts[address].codehash = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470_bytes32;
+	}
 }
 
 void EVMHost::newTransactionFrame()
@@ -290,6 +297,10 @@ evmc::Result EVMHost::call(evmc_message const& _message) noexcept
 	}
 	else if (_message.recipient == 0x0000000000000000000000000000000000000009_address && m_evmVersion >= langutil::EVMVersion::istanbul())
 		return precompileBlake2f(_message);
+	else if (_message.recipient == 0x0000000000000000000000000000000000000012_address)
+		return precompileVerifyMLDSA(_message);
+	else if (_message.recipient == 0x0000000000000000000000000000000000000013_address)
+		return precompileVerifyMLDSAEth(_message);
 
 	auto const stateBackup = accounts;
 
@@ -1255,6 +1266,552 @@ evmc::Result EVMHost::precompileBlake2f(evmc_message const&) noexcept
 {
 	// TODO implement
 	return resultWithFailure();
+}
+
+// ============================================================
+// EIP-8051 ML-DSA-44 precompile implementation (file-local)
+// Ported from go-ethereum contracts_mldsa.go (FIPS 204 Algorithm 8).
+// ============================================================
+namespace
+{
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+constexpr int32_t MLDSA_N      = 256;
+constexpr int32_t MLDSA_Q      = 8380417;
+constexpr int32_t MLDSA_K      = 4;
+constexpr int32_t MLDSA_L      = 4;
+constexpr int32_t MLDSA_GAMMA1 = 1 << 17;          // 131072
+constexpr int32_t MLDSA_GAMMA2 = (MLDSA_Q - 1) / 88; // 95232
+constexpr int32_t MLDSA_BETA   = 78;
+constexpr int32_t MLDSA_TAU    = 39;
+constexpr int32_t MLDSA_D      = 13;
+constexpr int32_t MLDSA_OMEGA  = 80;
+constexpr int32_t MLDSA_N_INV  = 8347681; // 256^{-1} mod q
+
+constexpr size_t MLDSA_MSG_SIZE   = 32;
+constexpr size_t MLDSA_SIG_SIZE   = 2420;  // 32 c_tilde + 2304 z + 84 h
+constexpr size_t MLDSA_PK_SIZE    = 20512; // 16384 A_hat + 32 tr + 4096 t1
+constexpr size_t MLDSA_INPUT_SIZE = MLDSA_MSG_SIZE + MLDSA_SIG_SIZE + MLDSA_PK_SIZE;
+constexpr size_t MLDSA_AHAT_SIZE  = 16384; // k*l*n*4 bytes
+constexpr size_t MLDSA_TR_SIZE    = 32;
+constexpr size_t MLDSA_GAS       = 4500;
+
+using MLDSAPoly  = std::array<int32_t, MLDSA_N>;
+using MLDSAPolyL = std::array<MLDSAPoly, MLDSA_L>;
+using MLDSAPolyK = std::array<MLDSAPoly, MLDSA_K>;
+using MLDSAMatrix = std::array<std::array<MLDSAPoly, MLDSA_L>, MLDSA_K>;
+
+// ---------------------------------------------------------------------------
+// NTT twiddle factors: zetas[i] = pow(1753, bitrev8(i)) mod q
+// ---------------------------------------------------------------------------
+static uint8_t mldsaBitRev8(uint8_t x)
+{
+	x = static_cast<uint8_t>(((x & 0xF0u) >> 4) | ((x & 0x0Fu) << 4));
+	x = static_cast<uint8_t>(((x & 0xCCu) >> 2) | ((x & 0x33u) << 2));
+	x = static_cast<uint8_t>(((x & 0xAAu) >> 1) | ((x & 0x55u) << 1));
+	return x;
+}
+
+static int32_t mldsaPowModQ(int64_t base, int64_t exp)
+{
+	int64_t result = 1;
+	int64_t b = base % MLDSA_Q;
+	if (b < 0)
+		b += MLDSA_Q;
+	for (; exp > 0; exp >>= 1)
+	{
+		if (exp & 1)
+			result = (result * b) % MLDSA_Q;
+		b = (b * b) % MLDSA_Q;
+	}
+	return static_cast<int32_t>(result);
+}
+
+static std::array<int32_t, MLDSA_N> computeMldsaZetas()
+{
+	std::array<int32_t, MLDSA_N> z{};
+	constexpr int64_t psi = 1753;
+	for (int i = 0; i < MLDSA_N; i++)
+		z[i] = mldsaPowModQ(psi, static_cast<int64_t>(mldsaBitRev8(static_cast<uint8_t>(i))));
+	return z;
+}
+
+static std::array<int32_t, MLDSA_N> const mldsaZetas = computeMldsaZetas();
+
+// ---------------------------------------------------------------------------
+// Modular arithmetic
+// ---------------------------------------------------------------------------
+static int32_t mldsaModQ(int64_t x)
+{
+	int64_t r = x % MLDSA_Q;
+	if (r < 0)
+		r += MLDSA_Q;
+	return static_cast<int32_t>(r);
+}
+
+static int32_t mldsaAddQ(int32_t a, int32_t b) { return mldsaModQ(int64_t(a) + b); }
+static int32_t mldsaSubQ(int32_t a, int32_t b) { return mldsaModQ(int64_t(a) - b); }
+static int32_t mldsaMulQ(int32_t a, int32_t b) { return mldsaModQ(int64_t(a) * b); }
+
+// ---------------------------------------------------------------------------
+// NTT forward / inverse (Dilithium-specific, q = 8380417)
+// ---------------------------------------------------------------------------
+static MLDSAPoly mldsaNTTForward(MLDSAPoly a)
+{
+	int k = 0;
+	for (int length = 128; length >= 1; length >>= 1)
+	{
+		for (int start = 0; start < MLDSA_N; start += 2 * length)
+		{
+			k++;
+			int32_t zeta = mldsaZetas[k];
+			for (int j = start; j < start + length; j++)
+			{
+				int32_t t = mldsaMulQ(zeta, a[j + length]);
+				a[j + length] = mldsaSubQ(a[j], t);
+				a[j]          = mldsaAddQ(a[j], t);
+			}
+		}
+	}
+	return a;
+}
+
+static MLDSAPoly mldsaNTTInverse(MLDSAPoly a)
+{
+	int k = MLDSA_N;
+	for (int length = 1; length < MLDSA_N; length <<= 1)
+	{
+		for (int start = 0; start < MLDSA_N; start += 2 * length)
+		{
+			k--;
+			int32_t zeta = mldsaZetas[k];
+			for (int j = start; j < start + length; j++)
+			{
+				int32_t t = a[j];
+				a[j]          = mldsaAddQ(t, a[j + length]);
+				a[j + length] = mldsaMulQ(zeta, mldsaSubQ(a[j + length], t));
+			}
+		}
+	}
+	for (int i = 0; i < MLDSA_N; i++)
+		a[i] = mldsaMulQ(a[i], MLDSA_N_INV);
+	return a;
+}
+
+// ---------------------------------------------------------------------------
+// Polynomial / vector / matrix operations
+// ---------------------------------------------------------------------------
+static MLDSAPoly mldsaPolyAdd(MLDSAPoly const& a, MLDSAPoly const& b)
+{
+	MLDSAPoly c{};
+	for (int i = 0; i < MLDSA_N; i++)
+		c[i] = mldsaAddQ(a[i], b[i]);
+	return c;
+}
+
+static MLDSAPoly mldsaPolySub(MLDSAPoly const& a, MLDSAPoly const& b)
+{
+	MLDSAPoly c{};
+	for (int i = 0; i < MLDSA_N; i++)
+		c[i] = mldsaSubQ(a[i], b[i]);
+	return c;
+}
+
+static MLDSAPoly mldsaPolyMulNTT(MLDSAPoly const& a, MLDSAPoly const& b)
+{
+	MLDSAPoly c{};
+	for (int i = 0; i < MLDSA_N; i++)
+		c[i] = mldsaMulQ(a[i], b[i]);
+	return c;
+}
+
+static MLDSAPolyK mldsaMatVecMulNTT(MLDSAMatrix const& aHat, MLDSAPolyL const& v)
+{
+	MLDSAPolyK result{};
+	for (int i = 0; i < MLDSA_K; i++)
+		for (int j = 0; j < MLDSA_L; j++)
+			result[i] = mldsaPolyAdd(result[i], mldsaPolyMulNTT(aHat[i][j], v[j]));
+	return result;
+}
+
+// ---------------------------------------------------------------------------
+// Encoding / Decoding
+// ---------------------------------------------------------------------------
+static bool mldsaDecodeAHat(uint8_t const* data, MLDSAMatrix& m)
+{
+	size_t off = 0;
+	for (int i = 0; i < MLDSA_K; i++)
+		for (int j = 0; j < MLDSA_L; j++)
+			for (int c = 0; c < MLDSA_N; c++, off += 4)
+			{
+				int32_t v = static_cast<int32_t>(
+					static_cast<uint32_t>(data[off]) |
+					(static_cast<uint32_t>(data[off+1]) << 8) |
+					(static_cast<uint32_t>(data[off+2]) << 16) |
+					(static_cast<uint32_t>(data[off+3]) << 24));
+				if (v < 0 || v >= MLDSA_Q)
+					return false;
+				m[i][j][c] = v;
+			}
+	return true;
+}
+
+static bool mldsaDecodePolys(uint8_t const* data, int count, MLDSAPolyK& polys)
+{
+	size_t off = 0;
+	for (int i = 0; i < count; i++)
+		for (int c = 0; c < MLDSA_N; c++, off += 4)
+		{
+			int32_t v = static_cast<int32_t>(
+				static_cast<uint32_t>(data[off]) |
+				(static_cast<uint32_t>(data[off+1]) << 8) |
+				(static_cast<uint32_t>(data[off+2]) << 16) |
+				(static_cast<uint32_t>(data[off+3]) << 24));
+			if (v < 0 || v >= MLDSA_Q)
+				return false;
+			polys[i][c] = v;
+		}
+	return true;
+}
+
+// 18-bit packed signed coefficients: stored as gamma1 - coeff (unsigned 18-bit).
+// 4 coefficients = 72 bits = 9 bytes.
+static bool mldsaDecodeZ(uint8_t const* data, MLDSAPolyL& z)
+{
+	for (int i = 0; i < MLDSA_L; i++)
+	{
+		uint8_t const* pd = data + i * 576;
+		for (int j = 0; j < MLDSA_N / 4; j++)
+		{
+			int base = j * 9;
+			uint32_t c0 = uint32_t(pd[base+0]) | (uint32_t(pd[base+1]) << 8) | ((uint32_t(pd[base+2]) & 0x03u) << 16);
+			uint32_t c1 = (uint32_t(pd[base+2]) >> 2) | (uint32_t(pd[base+3]) << 6) | ((uint32_t(pd[base+4]) & 0x0Fu) << 14);
+			uint32_t c2 = (uint32_t(pd[base+4]) >> 4) | (uint32_t(pd[base+5]) << 4) | ((uint32_t(pd[base+6]) & 0x3Fu) << 12);
+			uint32_t c3 = (uint32_t(pd[base+6]) >> 6) | (uint32_t(pd[base+7]) << 2) | (uint32_t(pd[base+8]) << 10);
+			z[i][j*4+0] = mldsaModQ(int64_t(MLDSA_GAMMA1) - int64_t(c0));
+			z[i][j*4+1] = mldsaModQ(int64_t(MLDSA_GAMMA1) - int64_t(c1));
+			z[i][j*4+2] = mldsaModQ(int64_t(MLDSA_GAMMA1) - int64_t(c2));
+			z[i][j*4+3] = mldsaModQ(int64_t(MLDSA_GAMMA1) - int64_t(c3));
+		}
+	}
+	return true;
+}
+
+// FIPS 204 Algorithm 21 (HintBitUnpack): omega+k = 84 bytes.
+static bool mldsaDecodeH(uint8_t const* data, MLDSAPolyK& h)
+{
+	int idx = 0;
+	for (int i = 0; i < MLDSA_K; i++)
+	{
+		int limit = static_cast<int>(data[MLDSA_OMEGA + i]);
+		if (limit < idx || limit > MLDSA_OMEGA)
+			return false;
+		int prev = -1;
+		for (; idx < limit; idx++)
+		{
+			int pos = static_cast<int>(data[idx]);
+			if (pos >= MLDSA_N || pos <= prev)
+				return false;
+			h[i][pos] = 1;
+			prev = pos;
+		}
+	}
+	for (int i = idx; i < MLDSA_OMEGA; i++)
+		if (data[i] != 0)
+			return false;
+	return true;
+}
+
+// w1 coefficients (each in [0, (q-1)/(2*gamma2)]) packed as 6-bit values.
+// 4 coefficients per 3 bytes, 256 coefficients → 192 bytes per poly.
+static bytes mldsaEncodeW1(MLDSAPolyK const& w1)
+{
+	bytes out(MLDSA_K * 192, 0);
+	for (int i = 0; i < MLDSA_K; i++)
+	{
+		for (int j = 0; j < MLDSA_N / 4; j++)
+		{
+			uint8_t c0 = static_cast<uint8_t>(w1[i][j*4+0] & 0x3F);
+			uint8_t c1 = static_cast<uint8_t>(w1[i][j*4+1] & 0x3F);
+			uint8_t c2 = static_cast<uint8_t>(w1[i][j*4+2] & 0x3F);
+			uint8_t c3 = static_cast<uint8_t>(w1[i][j*4+3] & 0x3F);
+			size_t base = static_cast<size_t>(i) * 192 + static_cast<size_t>(j) * 3;
+			out[base+0] = static_cast<uint8_t>(c0 | (c1 << 6));
+			out[base+1] = static_cast<uint8_t>((c1 >> 2) | (c2 << 4));
+			out[base+2] = static_cast<uint8_t>((c2 >> 4) | (c3 << 2));
+		}
+	}
+	return out;
+}
+
+// ---------------------------------------------------------------------------
+// Norm check
+// ---------------------------------------------------------------------------
+static bool mldsaCheckZNorm(MLDSAPolyL const& z)
+{
+	int32_t bound = MLDSA_GAMMA1 - MLDSA_BETA;
+	for (int i = 0; i < MLDSA_L; i++)
+		for (int j = 0; j < MLDSA_N; j++)
+		{
+			int32_t v = z[i][j];
+			if (v > MLDSA_Q / 2)
+				v -= MLDSA_Q;
+			if (v < 0)
+				v = -v;
+			if (v >= bound)
+				return false;
+		}
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Decompose / UseHint (FIPS 204 Algorithms 36-37)
+// ---------------------------------------------------------------------------
+static int32_t mldsaCenterMod(int32_t a, int32_t alpha)
+{
+	int32_t r = a % alpha;
+	if (r < 0)
+		r += alpha;
+	if (r > alpha / 2)
+		r -= alpha;
+	return r;
+}
+
+static std::pair<int32_t, int32_t> mldsaDecompose(int32_t r)
+{
+	int32_t r0 = mldsaCenterMod(r, 2 * MLDSA_GAMMA2);
+	if (int64_t(r) - int64_t(r0) == int64_t(MLDSA_Q) - 1)
+		return {0, r0 - 1};
+	return {static_cast<int32_t>((int64_t(r) - int64_t(r0)) / (2 * MLDSA_GAMMA2)), r0};
+}
+
+static int32_t mldsaUseHint(int32_t hint, int32_t r)
+{
+	auto [r1, r0] = mldsaDecompose(r);
+	if (hint == 0)
+		return r1;
+	int32_t m = static_cast<int32_t>((MLDSA_Q - 1) / (2 * MLDSA_GAMMA2));
+	if (r0 > 0)
+		return (r1 + 1) % m;
+	return (r1 - 1 + m) % m;
+}
+
+// ---------------------------------------------------------------------------
+// XOF: Keccak PRNG (ML-DSA-ETH variant, EIP-8051)
+// seed || counter(8 bytes BE) → Keccak256 → 32 bytes per block
+// ---------------------------------------------------------------------------
+struct KeccakPRNG
+{
+	bytes seed;
+	uint64_t ctr = 0;
+	bytes buf;
+	size_t pos = 0;
+
+	void write(uint8_t const* data, size_t len)
+	{
+		seed.insert(seed.end(), data, data + len);
+	}
+
+	// Read n bytes, filling internal buffer from Keccak256 blocks as needed.
+	void read(uint8_t* out, size_t n)
+	{
+		for (size_t done = 0; done < n; )
+		{
+			if (pos >= buf.size())
+			{
+				// Append 8-byte BE counter to seed, hash, advance counter.
+				bytes input = seed;
+				input.resize(seed.size() + 8);
+				for (int b = 7; b >= 0; b--)
+					input[seed.size() + static_cast<size_t>(b)] = static_cast<uint8_t>(ctr >> (8 * (7 - b)));
+				util::h256 h = util::keccak256(input);
+				buf.assign(h.data(), h.data() + 32);
+				ctr++;
+				pos = 0;
+			}
+			size_t chunk = std::min(n - done, buf.size() - pos);
+			std::memcpy(out + done, buf.data() + pos, chunk);
+			pos  += chunk;
+			done += chunk;
+		}
+	}
+};
+
+// ---------------------------------------------------------------------------
+// Hash computations
+// ---------------------------------------------------------------------------
+
+// mu = XOF(tr || msg).squeeze(64)
+static bytes mldsaComputeMu(uint8_t const* tr, uint8_t const* msg, bool useKeccak)
+{
+	bytes input(MLDSA_TR_SIZE + MLDSA_MSG_SIZE);
+	std::memcpy(input.data(), tr,  MLDSA_TR_SIZE);
+	std::memcpy(input.data() + MLDSA_TR_SIZE, msg, MLDSA_MSG_SIZE);
+
+	bytes mu(64);
+	if (useKeccak)
+	{
+		KeccakPRNG prng;
+		prng.write(input.data(), input.size());
+		prng.read(mu.data(), 64);
+	}
+	else
+		util::shake256(mu.data(), 64, input.data(), input.size());
+	return mu;
+}
+
+// FIPS 204 Algorithm 29: SampleInBall.
+// Pre-generates a fixed XOF buffer to avoid streaming; 1024 bytes >> expected usage.
+static MLDSAPoly mldsaSampleInBall(uint8_t const* seed, bool useKeccak)
+{
+	constexpr size_t BUF_SIZE = 1024;
+	bytes buf(BUF_SIZE);
+	if (useKeccak)
+	{
+		KeccakPRNG prng;
+		prng.write(seed, 32);
+		prng.read(buf.data(), BUF_SIZE);
+	}
+	else
+		util::shake256(buf.data(), BUF_SIZE, seed, 32);
+
+	MLDSAPoly c{};
+	uint64_t signs = 0;
+	for (int b = 0; b < 8; b++)
+		signs |= (uint64_t(buf[b]) << (8 * b));
+
+	size_t bufPos = 8;
+	for (int i = MLDSA_N - MLDSA_TAU; i < MLDSA_N; i++)
+	{
+		int j;
+		do
+		{
+			if (bufPos >= BUF_SIZE)
+				return c; // exhausted: should not happen for valid inputs
+			j = static_cast<int>(buf[bufPos++]);
+		} while (j > i);
+		c[i] = c[j];
+		c[j] = (signs & 1) ? MLDSA_Q - 1 : 1; // -1 mod q or +1
+		signs >>= 1;
+	}
+	return c;
+}
+
+// c_tilde' = XOF(mu || encodeW1(w1')).squeeze(32)
+static bytes mldsaComputeCTilde(bytes const& mu, MLDSAPolyK const& w1Prime, bool useKeccak)
+{
+	bytes w1Enc = mldsaEncodeW1(w1Prime);
+	bytes input(mu.size() + w1Enc.size());
+	std::memcpy(input.data(), mu.data(), mu.size());
+	std::memcpy(input.data() + mu.size(), w1Enc.data(), w1Enc.size());
+
+	bytes out(32);
+	if (useKeccak)
+	{
+		KeccakPRNG prng;
+		prng.write(input.data(), input.size());
+		prng.read(out.data(), 32);
+	}
+	else
+		util::shake256(out.data(), 32, input.data(), input.size());
+	return out;
+}
+
+// ---------------------------------------------------------------------------
+// Core verification (FIPS 204 Algorithm 8)
+// ---------------------------------------------------------------------------
+static bool mldsaVerifyCore(uint8_t const* input, bool useKeccak)
+{
+	uint8_t const* msg      = input;
+	uint8_t const* sigBytes = input + MLDSA_MSG_SIZE;
+	uint8_t const* pkBytes  = input + MLDSA_MSG_SIZE + MLDSA_SIG_SIZE;
+
+	// Decode public key.
+	MLDSAMatrix aHat{};
+	if (!mldsaDecodeAHat(pkBytes, aHat))
+		return false;
+	uint8_t const* tr = pkBytes + MLDSA_AHAT_SIZE;
+	MLDSAPolyK t1{};
+	if (!mldsaDecodePolys(pkBytes + MLDSA_AHAT_SIZE + MLDSA_TR_SIZE, MLDSA_K, t1))
+		return false;
+
+	// Decode signature.
+	uint8_t const* cTilde = sigBytes;
+	MLDSAPolyL z{};
+	if (!mldsaDecodeZ(sigBytes + 32, z))
+		return false;
+	MLDSAPolyK h{};
+	if (!mldsaDecodeH(sigBytes + 32 + 2304, h))
+		return false;
+
+	// Check ||z||_inf < gamma1 - beta.
+	if (!mldsaCheckZNorm(z))
+		return false;
+
+	// mu = XOF(tr || msg).squeeze(64)
+	bytes mu = mldsaComputeMu(tr, msg, useKeccak);
+
+	// c = SampleInBall(c_tilde); compute NTT(c).
+	MLDSAPoly c    = mldsaSampleInBall(cTilde, useKeccak);
+	MLDSAPoly cNTT = mldsaNTTForward(c);
+
+	// NTT(z)
+	MLDSAPolyL zNTT{};
+	for (int i = 0; i < MLDSA_L; i++)
+		zNTT[i] = mldsaNTTForward(z[i]);
+
+	// w = INTT(A_hat * NTT(z) - NTT(c) * (2^d * t1))
+	MLDSAPolyK az = mldsaMatVecMulNTT(aHat, zNTT);
+	MLDSAPolyK w{};
+	for (int i = 0; i < MLDSA_K; i++)
+	{
+		MLDSAPoly ct1{};
+		for (int j = 0; j < MLDSA_N; j++)
+		{
+			int32_t scaled = mldsaMulQ(t1[i][j], 1 << MLDSA_D);
+			ct1[j] = mldsaMulQ(cNTT[j], scaled);
+		}
+		w[i] = mldsaNTTInverse(mldsaPolySub(az[i], ct1));
+	}
+
+	// w1' = UseHint(h, w)
+	MLDSAPolyK w1Prime{};
+	for (int i = 0; i < MLDSA_K; i++)
+		for (int j = 0; j < MLDSA_N; j++)
+			w1Prime[i][j] = mldsaUseHint(h[i][j], w[i][j]);
+
+	// c_tilde' = XOF(mu || encodeW1(w1')).squeeze(32)
+	bytes cTildeCheck = mldsaComputeCTilde(mu, w1Prime, useKeccak);
+
+	return std::equal(cTildeCheck.begin(), cTildeCheck.end(), cTilde);
+}
+
+} // anonymous namespace
+
+evmc::Result EVMHost::precompileVerifyMLDSA(evmc_message const& _message) noexcept
+{
+	static bytes output;
+	if (_message.input_size != MLDSA_INPUT_SIZE)
+		return resultWithFailure();
+	bool valid = mldsaVerifyCore(_message.input_data, false);
+	output = bytes(32, 0);
+	if (valid)
+		output[31] = 1;
+	return resultWithGas(_message.gas, static_cast<int64_t>(MLDSA_GAS), output);
+}
+
+evmc::Result EVMHost::precompileVerifyMLDSAEth(evmc_message const& _message) noexcept
+{
+	static bytes output;
+	if (_message.input_size != MLDSA_INPUT_SIZE)
+		return resultWithFailure();
+	bool valid = mldsaVerifyCore(_message.input_data, true);
+	output = bytes(32, 0);
+	if (valid)
+		output[31] = 1;
+	return resultWithGas(_message.gas, static_cast<int64_t>(MLDSA_GAS), output);
 }
 
 evmc::Result EVMHost::precompileGeneric(
