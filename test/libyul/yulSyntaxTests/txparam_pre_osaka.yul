@@ -1,11 +1,21 @@
 {
     {
-        let txparamload := 1
+        let txparam := 1
     }
 
     {
-        function txparamsize() {}
-        txparamsize()
+        function frameparam() {}
+        frameparam()
+    }
+
+    {
+        function framedataload() {}
+        framedataload()
+    }
+
+    {
+        function framedatacopy() {}
+        framedatacopy()
     }
 }
 

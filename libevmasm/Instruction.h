@@ -186,9 +186,10 @@ enum class Instruction: uint8_t
 
 	APPROVE = 0xaa,           ///< halt execution with scope-based approval (EIP-8141)
 
-	TXPARAMLOAD = 0xb0,       ///< load transaction parameter data (EIP-8141)
-	TXPARAMSIZE,              ///< get size of transaction parameter (EIP-8141)
-	TXPARAMCOPY,              ///< copy transaction parameter data to memory (EIP-8141)
+	TXPARAM = 0xb0,           ///< load transaction-scoped information (EIP-8141)
+	FRAMEDATALOAD,            ///< load frame input data (EIP-8141)
+	FRAMEDATACOPY,            ///< copy frame input data to memory (EIP-8141)
+	FRAMEPARAM,               ///< load frame-scoped information (EIP-8141)
 
 	DATALOADN = 0xd1,         ///< load data from EOF data section
 

@@ -45,9 +45,10 @@ bool EVMVersion::hasOpcode(Instruction _opcode, std::optional<uint8_t> _eofVersi
 	case Instruction::CLZ:
 		return hasCLZ();
 	case Instruction::APPROVE:
-	case Instruction::TXPARAMLOAD:
-	case Instruction::TXPARAMSIZE:
-	case Instruction::TXPARAMCOPY:
+	case Instruction::TXPARAM:
+	case Instruction::FRAMEDATALOAD:
+	case Instruction::FRAMEDATACOPY:
+	case Instruction::FRAMEPARAM:
 		return hasFrameTransaction();
 	case Instruction::CREATE2:
 		return !_eofVersion.has_value() && hasCreate2();
